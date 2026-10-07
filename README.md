@@ -1,13 +1,35 @@
 # Pre-Deploy Observability Reviewer — Custom DevOps Agent
 
-A **tool-agnostic** way to run the pre-deploy alarm-coverage review: a DevOps Agent
+# Observability Agent — Pre-Deploy Alarm Coverage Reviewer
+
+A **tool-agnostic** way to run a pre-deploy alarm-coverage review: a DevOps Agent
 **custom agent** with the `predeploy-alarm-recommendations` skill attached. You point
 it at your Infrastructure as Code (Terraform, CloudFormation, or CDK) and it returns
 inline alarm recommendations — no Jenkins, no API Gateway, no CI tool required.
 
-This is the "unbind it from Jenkins" path. The Jenkins integration in
-`devops-auto/jenkins-predeploy-alarms/` still works and is one example trigger, but
-the custom agent below is the portable, CI-independent version.
+The custom agent is the portable, CI-independent way to run the review. It can also be
+driven from any CI system (a pipeline stage that calls the DevOps Agent), but no CI
+tool is required — a human asking in the IDE is a complete workflow.
+
+---
+
+## What's in this repo
+
+```
+.
+├── system-prompt.md        # the custom agent's system prompt (import this)
+├── README.md               # this file
+└── skills/
+    └── predeploy-alarm-recommendations/   # the skill the agent depends on
+        ├── SKILL.md
+        ├── README.md
+        └── references/     # per-service baselines + IaC parsing runbooks
+```
+
+The agent is two parts, attached separately in the DevOps Agent console:
+1. **System prompt** — `system-prompt.md` (defines behavior).
+2. **Skill** — `skills/predeploy-alarm-recommendations/` (the alarm baselines and the
+   Terraform/CloudFormation/CDK parsing runbooks). Uploaded as a zip, then attached.
 
 ---
 
@@ -30,8 +52,9 @@ that post-deploy root cause analysis needs, because nothing has deployed yet.
 ## Prerequisites
 
 - An Agent Space with at least one connected integration (your AWS account).
-- The `predeploy-alarm-recommendations` skill uploaded to that Agent Space
-  (see `devops-auto/aws-devops-agent-skills/predeploy-alarm-recommendations/README.md`).
+- The `predeploy-alarm-recommendations` skill uploaded to that Agent Space. The skill
+  ships **inside this repo** at `skills/predeploy-alarm-recommendations/`
+  (see its own `README.md` there for details).
 - For running it from your IDE: the DevOps Agent connected over MCP (see "Connect
   from Kiro" below). You already have this working if `get_agent_space` returns your
   space.
@@ -50,7 +73,7 @@ exactly that.
 1. Push this repo (or just `system-prompt.md`) to a GitHub repo your Agent Space's
    connected GitHub account can read.
 2. In the DevOps Agent web app → **Agents** → **Create agent** → **Import from
-   repository**, point it at `devops-auto/custom-agent/system-prompt.md`.
+   repository**, point it at `system-prompt.md` at the repo root.
 3. The file contents become the agent's system prompt. Name it
    `pre-deploy-observability-reviewer` (lowercase, hyphens, ≤64 chars).
 
@@ -72,11 +95,23 @@ Chat will confirm intent, attach the skill, and draft the prompt for your review
 
 ---
 
-## Step 2 — Attach the skill
+## Step 2 — Upload and attach the skill
 
-If you did not attach it during creation (e.g. the import path), open the agent's
-detail page and add the **predeploy-alarm-recommendations** skill. This is what gives
-the agent the per-service baselines and the T1/T2 IaC parsing runbooks.
+The skill ships in this repo at `skills/predeploy-alarm-recommendations/`. Package it
+and upload it to your Agent Space, then attach it to the agent.
+
+1. **Zip the skill** (exclude macOS/editor junk, or the console upload will reject it):
+   ```bash
+   cd skills
+   zip -r -X predeploy-alarm-recommendations.zip predeploy-alarm-recommendations \
+     -x '*.DS_Store' -x '__MACOSX*'
+   ```
+2. **Upload:** DevOps Agent web app → **Settings → Add Skill → Upload Skill** → select
+   the zip. The console validates the `SKILL.md` frontmatter (e.g. `description` must be
+   ≤1024 characters), so upload the version from this repo, which is within limits.
+3. **Attach:** open the agent's detail page and add the
+   **predeploy-alarm-recommendations** skill. This is what gives the agent the
+   per-service baselines and the T1/T2 IaC parsing runbooks.
 
 ---
 
@@ -143,8 +178,8 @@ sts:GetCallerIdentity
 ```
 
 Do NOT grant `cloudwatch:PutMetricAlarm`, any `Create*`/`Update*`/`Delete*`, or deploy
-permissions. The agent recommends alarms; deploying them (via
-`jenkins-predeploy-alarms/recommended-alarms.yaml`) is a separate, explicit human step.
+permissions. The agent recommends alarms; deploying them (e.g. via a CloudFormation
+baseline template) is a separate, explicit human step.
 
 ---
 
@@ -152,9 +187,8 @@ permissions. The agent recommends alarms; deploying them (via
 
 Already done if your `~/.kiro/settings/mcp.json` `powers` block has the
 `power-aws-devops-agent-aws-devops-agent` server with a resolved URL + bearer token,
-and `get_agent_space` returns your space (`shrome-demo`). If not, see
-`devops-auto/jenkins-predeploy-alarms/README.md` or the AWS docs for the token setup
-(DevOps Agent web app → Settings → Access Tokens).
+and `get_agent_space` returns your Agent Space. If not, see the AWS docs for the token
+setup (DevOps Agent web app → Settings → Access Tokens).
 
 ---
 
@@ -178,9 +212,9 @@ cdk synth > /dev/null   # writes cdk.out/<Stack>.template.json
 ```
 > Review the alarm coverage for the synthesized CDK template in cdk.out/.
 
-The agent returns inline recommendations plus a coverage-gap summary, and maps them to
-the tiers in `jenkins-predeploy-alarms/recommended-alarms.yaml` so you can deploy the
-alarms if you choose.
+The agent returns inline recommendations plus a coverage-gap summary, with the metric,
+threshold, comparison, and evaluation period for each recommended alarm so you can
+deploy them (e.g. via a CloudFormation baseline template) if you choose.
 
 ---
 

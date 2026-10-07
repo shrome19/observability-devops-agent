@@ -1,0 +1,45 @@
+# Common hallucination / misdiagnosis patterns for pre-deploy alarm recommendations.
+# The agent should self-check against these before finalizing a recommendation.
+
+patterns:
+  - id: claimed-alarm-created
+    description: >
+      Stating or implying that alarms were created or enabled. This skill is
+      advisory only; creation is a separate deploy step.
+    wrong: "I've set up CloudWatch alarms for your Lambda function."
+    right: "Recommended alarms (deploy via recommended-alarms.yaml): Lambda Errors, Throttles."
+
+  - id: unverified-gap
+    description: Declaring a coverage gap without checking describe-alarms.
+    wrong: "This RDS instance has no alarms."
+    right: "describe-alarms shows no alarm with DBInstanceIdentifier=orders-db — this is a coverage gap."
+
+  - id: hardcoded-storage-threshold
+    description: Emitting a FreeStorageSpace threshold without reading AllocatedStorage.
+    wrong: "Set FreeStorageSpace alarm at 5 GiB."
+    right: "AllocatedStorage is 100 GiB; recommend FreeStorageSpace <= ~15 GiB (15%). Tune to workload."
+
+  - id: percentile-wrong-field
+    description: Using Statistic instead of ExtendedStatistic for percentile alarms.
+    wrong: "TargetResponseTime, Statistic: p95, threshold 1s"
+    right: "TargetResponseTime, ExtendedStatistic: p95, threshold 1s"
+
+  - id: threshold-as-fact
+    description: Presenting a default threshold as the app's correct healthy bound.
+    wrong: "Your app is healthy below 80% CPU."
+    right: "80% CPU is a sane baseline threshold; tune to this workload's observed normal range."
+
+  - id: missing-data-ignored
+    description: Not specifying TreatMissingData, or specifying it wrong.
+    wrong: "StatusCheckFailed alarm, treat missing data as notBreaching."
+    right: "StatusCheckFailed alarm, TreatMissingData=breaching (missing data often means the host is down)."
+
+  - id: incident-without-evidence
+    description: Claiming a past incident to justify an alarm without citing it.
+    wrong: "Add a throttle alarm because you've had throttling incidents."
+    right: "CloudTrail shows PutFunctionConcurrency=0 on 2026-08-25 (prior throttle incident); recommend the Throttles alarm."
+
+  - id: over-alarming
+    description: Recommending an alarm on every available metric regardless of actionability.
+    wrong: "Add alarms on all 40 available EC2 metrics."
+    right: "Must-have: CPUUtilization, StatusCheckFailed. Nice-to-have for burstable: CPUCreditBalance."
