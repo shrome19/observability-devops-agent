@@ -80,7 +80,75 @@ the agent the per-service baselines and the T1/T2 IaC parsing runbooks.
 
 ---
 
-## Step 3 — Connect from Kiro (over MCP)
+## Step 3 — Choose the agent's tools
+
+When creating or editing the agent, the DevOps Agent console presents a tool picker
+(its built-in capabilities). Select the minimum set this advisory agent needs — and
+deliberately leave off anything that can write, deploy, or orchestrate, so the agent
+stays true to its "recommends, never acts" contract.
+
+### Select — core (the agent cannot work without these)
+
+| Tool | Why |
+|------|-----|
+| `use_aws` | The critical one. Runs the read-only AWS describe/list calls the skill's workflow depends on: `cloudwatch describe-alarms`, `ec2 describe-instances`, `lambda get-function-configuration`, `rds describe-db-instances`, `elasticloadbalancing describe-load-balancers`, `elasticache describe-cache-clusters`, `opensearch describe-domain`, `s3api get-bucket-metrics-configuration`, `cloudhsmv2 describe-clusters`. |
+| `get_skill_resource` | Lets the agent read the attached skill's files (SKILL.md and the A1/B1/C1/D1/E1/E2/F1/G1/T1/T2/Z1 references) so it actually loads the baselines and IaC parsing runbooks. |
+| `get_skill_resource_manifest` | Lets the agent discover which skill files exist before reading them. Pair with `get_skill_resource`. |
+
+### Select — recommended (match specific skill steps)
+
+| Tool | Why |
+|------|-----|
+| `lookup_cloudtrail_events` | Powers the skill's Step 3 "enrich from history" (`cloudtrail lookup-events`) — recommend alarms that would have caught past incidents. |
+| `get_account_cloudformation_stacks` | When the IaC is a CloudFormation stack already deployed, reads its resources directly — complements the T2 CloudFormation/CDK parsing runbook. |
+
+### Optional (only if you want extra behavior)
+
+| Tool | Why / when |
+|------|-----------|
+| `explore_cloud_resource_topology`, `get_cloud_resource_topology`, `get_resource_edges` | Live topology mapping. Not needed for IaC-input review; add only if you also want the agent to look at how existing resources connect. |
+| `get_other_agentspace_journal_records`, `get_recommendation_investigation_*` | Read prior investigations. Marginal for a pre-deploy review. |
+
+### Do NOT select (keeps it advisory, read-only, and honest)
+
+- Write / mutation: `upload_skill`, `create_or_update_artifact`, `attach_memory_stores`.
+- Wrong platform: `use_azure`, `use_kubectl` (this is an AWS/CloudWatch use case).
+- Multi-agent / investigation orchestration: `delegate_investigation`, `engage_members`, `escalate_to_lead`, `evaluate_plan`.
+- Unrelated data sources: `execute_dql_query`, `get_prometheus_metrics`, the `get_trace_*` tools, `trusted_advisor_*`, `read_ticket_comments`, `query_cloudwatch_logs`.
+
+### Minimum viable set
+
+`use_aws`, `get_skill_resource`, `get_skill_resource_manifest`, `lookup_cloudtrail_events`.
+Add `get_account_cloudformation_stacks` if you will review already-deployed CloudFormation stacks.
+
+### ⚠️ Read-only is enforced by IAM, not by the tool list
+
+`use_aws` is a **general** AWS tool — it can call far more than describe/list. The only
+thing that keeps this agent read-only is the **IAM role** attached to it. Selecting
+`use_aws` grants the capability; a least-privilege role is what enforces "advisory,
+never acts." Scope the agent's role to read-only actions and nothing more:
+
+```
+cloudwatch:DescribeAlarms, cloudwatch:ListMetrics,
+ec2:DescribeInstances,
+lambda:ListFunctions, lambda:GetFunctionConfiguration,
+rds:DescribeDBInstances,
+elasticloadbalancing:DescribeLoadBalancers,
+elasticache:DescribeCacheClusters,
+es:DescribeElasticsearchDomain*,  opensearch:DescribeDomain,
+s3:GetBucket*, s3:ListAllMyBuckets,
+cloudhsmv2:DescribeClusters,
+cloudtrail:LookupEvents,
+sts:GetCallerIdentity
+```
+
+Do NOT grant `cloudwatch:PutMetricAlarm`, any `Create*`/`Update*`/`Delete*`, or deploy
+permissions. The agent recommends alarms; deploying them (via
+`jenkins-predeploy-alarms/recommended-alarms.yaml`) is a separate, explicit human step.
+
+---
+
+## Step 4 — Connect from Kiro (over MCP)
 
 Already done if your `~/.kiro/settings/mcp.json` `powers` block has the
 `power-aws-devops-agent-aws-devops-agent` server with a resolved URL + bearer token,
@@ -90,7 +158,7 @@ and `get_agent_space` returns your space (`shrome-demo`). If not, see
 
 ---
 
-## Step 4 — Run a review
+## Step 5 — Run a review
 
 ### Terraform
 ```
