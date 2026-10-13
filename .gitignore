@@ -4,3 +4,12 @@
 # Editor
 .vscode/
 *.swp
+
+# Build artifacts (skill zips are generated for upload, not source)
+*.zip
+
+# Terraform working files (keep committed plan.json samples, ignore local state)
+.terraform/
+*.tfstate
+*.tfstate.*
+tfplan
