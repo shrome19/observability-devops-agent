@@ -1,0 +1,51 @@
+# Example GitHub Actions step — pre-deploy observability review after terraform apply.
+#
+# Drop this job into your deploy workflow AFTER the apply job. It checks out the repo
+# (to get review-alarms.sh + slim-plan.jq), installs jq, and runs the hook. The webhook
+# URL and secret come from GitHub repo/environment secrets — never hardcode them.
+#
+# This is a reference snippet. Adapt paths/needs to your workflow. The same
+# review-alarms.sh works unchanged in GitLab CI, Jenkins, CodeBuild, etc.
+
+name: terraform-deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  # ... your existing terraform apply job runs first ...
+
+  alarm-coverage-review:
+    runs-on: ubuntu-latest
+    # needs: [apply]           # run after your apply job
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.16.5
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Terraform init
+        run: terraform init -input=false
+        working-directory: ./infra      # <-- your Terraform dir
+
+      - name: Pre-deploy alarm coverage review
+        working-directory: ./infra
+        env:
+          AGENT_WEBHOOK_URL: ${{ secrets.AGENT_WEBHOOK_URL }}
+          AGENT_WEBHOOK_SECRET: ${{ secrets.AGENT_WEBHOOK_SECRET }}
+          # point at the script + jq filter wherever they live in your repo
+          SLIM_JQ: ${{ github.workspace }}/path/to/slim-plan.jq
+          STACK_NAME: ${{ github.event.repository.name }}
+        run: |
+          bash "${{ github.workspace }}/path/to/review-alarms.sh"
+
+      # The agent reviews asynchronously; this step only confirms the webhook
+      # accepted the payload (HTTP 2xx). It does NOT block the pipeline on the
+      # review result — this is an advisory signal, not a gate. If you want it to
+      # block, poll the agent's run history in a follow-up step and fail on
+      # must-have gaps (left out here to keep the advisory contract).
