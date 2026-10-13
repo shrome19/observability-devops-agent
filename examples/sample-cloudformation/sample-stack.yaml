@@ -1,0 +1,95 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Sample CloudFormation stack for testing the pre-deploy observability review.
+  Intentionally MIXED coverage: the Lambda function already has one alarm declared
+  (Errors), but is missing Throttles; the OpenSearch domain and S3 bucket have NO
+  alarms. This exercises the T2 "existing coverage declared in IaC" path — the agent
+  should NOT flag the Lambda Errors alarm as a gap, but SHOULD flag everything else.
+
+Parameters:
+  Env:
+    Type: String
+    Default: prod
+    AllowedValues: [prod, uat, dev]
+
+Resources:
+
+  # --- Serverless: has an Errors alarm, but NO Throttles alarm (partial coverage) ---
+  ApiHandler:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: checkout-api-handler
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Timeout: 30
+      MemorySize: 512
+      Role: !GetAtt ApiHandlerRole.Arn
+      Code:
+        ZipFile: |
+          export const handler = async () => ({ statusCode: 200 });
+      Tags:
+        - Key: env
+          Value: !Ref Env
+
+  ApiHandlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+
+  # Existing coverage, declared in IaC — the agent should recognize this and NOT
+  # flag Lambda Errors as a gap. Throttles is still missing.
+  ApiHandlerErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: checkout-api-handler-errors
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ApiHandler
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+
+  # --- Search: OpenSearch domain, NO alarms ---
+  SearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      DomainName: catalog-search-prod
+      EngineVersion: OpenSearch_2.11
+      ClusterConfig:
+        InstanceType: m6g.large.search
+        InstanceCount: 2
+      EBSOptions:
+        EBSEnabled: true
+        VolumeSize: 100
+        VolumeType: gp3
+      Tags:
+        - Key: env
+          Value: !Ref Env
+
+  # --- Storage: request-path-critical S3 bucket, NO alarms ---
+  AssetsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: checkout-assets-prod
+      Tags:
+        - Key: env
+          Value: !Ref Env
+
+Outputs:
+  ApiHandlerName:
+    Value: !Ref ApiHandler
+  SearchDomainName:
+    Value: !Ref SearchDomain
