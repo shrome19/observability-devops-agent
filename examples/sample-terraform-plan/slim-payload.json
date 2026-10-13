@@ -1,0 +1,44 @@
+{
+  "eventType": "deployment",
+  "action": "create",
+  "source": "terraform",
+  "stack": "payments-prod",
+  "region": "us-east-1",
+  "resources": [
+    {
+      "address": "aws_db_instance.payments",
+      "type": "aws_db_instance",
+      "action": "create",
+      "config": {
+        "identifier": "payments-prod",
+        "engine": "mysql",
+        "engine_version": "8.0.35",
+        "instance_class": "db.r6g.large",
+        "allocated_storage": 200,
+        "tags": { "env": "prod" }
+      }
+    },
+    {
+      "address": "aws_lambda_function.api",
+      "type": "aws_lambda_function",
+      "action": "create",
+      "config": {
+        "function_name": "payments-api-handler",
+        "runtime": "nodejs20.x",
+        "memory_size": 256,
+        "timeout": 15,
+        "tags": { "env": "prod" }
+      }
+    },
+    {
+      "address": "aws_lb.api",
+      "type": "aws_lb",
+      "action": "create",
+      "config": {
+        "name": "payments-api-alb",
+        "load_balancer_type": "application",
+        "tags": { "env": "prod" }
+      }
+    }
+  ]
+}

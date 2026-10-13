@@ -6,7 +6,15 @@ intentionally under-alarmed so the coverage gaps are obvious in a demo.
 | Example | Format | What it demonstrates |
 |---------|--------|----------------------|
 | `sample-terraform/main.tf` | Terraform | Full-gap review — EC2 + RDS + ElastiCache with **zero** alarms. Every resource is a coverage gap. Exercises the T1 Terraform-parsing runbook. |
+| `sample-terraform-plan/main.tf` + `plan.json` | Terraform (real plan JSON) | ALB + Lambda + RDS, no alarms. `plan.json` is genuine `terraform show -json` output (Terraform 1.16.5) for demoing the preferred plan-JSON input path. |
+| `sample-terraform-plan/slim-payload.json` | Slim payload | The sub-10K payload shape to paste into a run or POST to a webhook. Produced from `plan.json` by `slim-plan.jq`. |
+| `slim-plan.jq` | jq filter | Shrinks a full `terraform show -json` plan to the slim payload (keeps sizing fields, drops `after_unknown`/`sensitive_values`/`configuration`). |
 | `sample-cloudformation/sample-stack.yaml` | CloudFormation | **Mixed** coverage — a Lambda that already has an `Errors` alarm declared in the template (so the agent should NOT flag it) but is missing Throttles, plus an OpenSearch domain and S3 bucket with no alarms. Exercises the T2 runbook and the "existing coverage declared in IaC" path. |
+
+> ⚠️ **10,000-character input limit.** A full `terraform show -json` plan exceeds the
+> agent's input cap for even a few resources. For Terraform, pre-filter with
+> `slim-plan.jq` and feed the agent the slim payload — not the raw plan. See the
+> "Payload size limit" section in `../README.md`.
 
 ## How to run
 

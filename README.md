@@ -203,6 +203,18 @@ Then, in Kiro (or the DevOps Agent chat), ask the custom agent:
 > Using the pre-deploy-observability-reviewer agent, review the alarm coverage for
 > the Terraform plan in plan.json.
 
+> ⚠️ **Input is capped at 10,000 characters.** A full `terraform show -json` plan
+> blows past that for even a few resources (`after_unknown`, `sensitive_values`, and
+> the `configuration` block are the bulk of it). Pasting a raw full plan fails with a
+> generic "Failed to run agent" error — it is an input-size rejection, not an agent
+> problem. **Pre-filter the plan to a slim payload first** (see
+> [Payload size limit](#payload-size-limit-10000-characters) below). The repo ships a
+> `jq` filter that reduces a full plan to ~1 KB:
+> ```
+> terraform show -json tfplan | jq -f examples/slim-plan.jq > slim-payload.json
+> ```
+> Paste `slim-payload.json`, not `plan.json`.
+
 ### CloudFormation
 > Review the alarm coverage for the CloudFormation template at infra/template.yaml.
 
@@ -232,9 +244,66 @@ coverage and hands the decision back to you.
 
 ---
 
+## Payload size limit (10,000 characters)
+
+Both the manual **run-input field** and the **webhook event-trigger payload** are
+capped at **10,000 characters**. A full `terraform show -json` plan routinely exceeds
+this — our real 3-resource sample plan was ~13.8 KB. The cap is enforced *before* the
+agent starts, so an oversized input fails with a generic "Failed to run agent" message
+that looks like a config error but is not.
+
+**Do not** rely on the event trigger's JMESPath filter to shrink a full plan — if the
+projection still produces >10K characters, the agent gets no usable context (or does
+not run). **Pre-filter at the source instead.** The repo ships
+[`examples/slim-plan.jq`](examples/slim-plan.jq), which keeps only created resources
+and the size/capacity fields the skill needs (dropping `after_unknown`,
+`sensitive_values`, and `configuration`):
+
+```
+terraform show -json tfplan | jq -f examples/slim-plan.jq > slim-payload.json
+```
+
+On the sample plan this reduces 13,858 → ~1,200 characters. The slim shape looks like
+[`examples/sample-terraform-plan/slim-payload.json`](examples/sample-terraform-plan/slim-payload.json).
+
+---
+
 ## Triggering it automatically (optional)
 
-Because it is a custom agent, you can attach a **scheduled trigger** in the Agent Space
-to run it on a cadence, or invoke it from any CI step (a GitHub Action, GitLab job, or
-CodeBuild phase) that calls the DevOps Agent MCP/API with the IaC as input. None of
-those are required — a human asking in the IDE is a complete workflow on its own.
+The agent's **Triggers** tab supports both schedule-based and event-based triggers.
+
+### Scheduled trigger
+Attach a cron/rate trigger to run the agent on a cadence (e.g. a nightly scan of a
+known IaC repo). Good for drift/coverage audits.
+
+### Event trigger (webhook)
+Fire the agent on a deployment event. There is no built-in Terraform/CloudFormation
+integration that emits a webhook, so the pattern is:
+
+```
+terraform apply / CFN stack-complete
+   │  (EventBridge rule on deploy-complete, or a CI pipeline step)
+   ▼
+Lambda  ──POST slim payload──▶  Agent Space webhook (event-trigger integration)
+   ▼
+pre-deploy-observability-reviewer  →  loads skill  →  inline alarm-coverage review
+```
+
+Key points:
+1. **Pre-filter in the pipeline/Lambda** — POST the slim payload (the `slim-plan.jq`
+   shape), NOT the raw plan. The 10K cap applies to the webhook payload too.
+2. **Gate + project with a JMESPath filter** on the event trigger so the agent only
+   runs for relevant deploys and receives just the created resources:
+   ```
+   resources[?action=='create']
+   ```
+   - Non-empty (something is being created) → truthy → the agent runs with that list.
+   - Empty (update-only or destroy-only deploy) → no match → the agent does not run.
+3. To pass metadata alongside the filtered resources, wrap it in an object literal
+   (a projection that would otherwise be empty must be wrapped to pass through):
+   ```
+   {stack: stack, region: region, resources: resources[?action=='create']}
+   ```
+
+None of this is required — a human asking in the IDE is a complete workflow. The event
+trigger is for teams that want the review to fire automatically on every deploy.
