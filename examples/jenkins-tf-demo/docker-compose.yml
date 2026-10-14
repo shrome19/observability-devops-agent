@@ -7,16 +7,24 @@ services:
       - "50000:50000"   # agent port
     volumes:
       - jenkins_home:/var/jenkins_home
-      # Mount your AWS credentials read-only so terraform can deploy.
-      # Alternative: inject AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY as env below.
-      - ${HOME}/.aws:/var/jenkins_home/.aws:ro
+      # NOTE: the ~/.aws mount is DISABLED on purpose. Isengard profiles use
+      # `credential_process = isengardcli`, which does not exist inside the
+      # container, so mounting the profile fails with "No such file: isengardcli".
+      # We pass static temp keys as env vars instead (set them in your host shell
+      # before `docker compose up`). To use a mounted profile with STATIC keys
+      # (no credential_process), re-enable this line and set AWS_PROFILE below.
+      # - ${HOME}/.aws:/var/jenkins_home/.aws:ro
     environment:
-      - AWS_PROFILE=${AWS_PROFILE:-default}
+      # Static credentials, read from your HOST shell. Export the real values
+      # before running compose (do NOT paste secrets into this file):
+      #   export AWS_ACCESS_KEY_ID=ASIA...
+      #   export AWS_SECRET_ACCESS_KEY=...
+      #   export AWS_SESSION_TOKEN=...      # required for temporary/Isengard creds
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
       - AWS_REGION=${AWS_REGION:-us-east-1}
-      # If you prefer static keys instead of a mounted profile, uncomment and set:
-      # - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      # - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      # - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
+      # AWS_PROFILE intentionally omitted — using static keys above, not a profile.
 
 volumes:
   jenkins_home:

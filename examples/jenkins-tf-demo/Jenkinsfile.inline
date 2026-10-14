@@ -1,0 +1,184 @@
+// SELF-CONTAINED variant of the Jenkins + Terraform demo.
+//
+// Use this when you paste the pipeline directly into a Jenkins "Pipeline script" box
+// (no SCM checkout). Because there is no source checkout, the workspace would be empty,
+// so this version WRITES main.tf into the workspace itself (the "Write Terraform" stage).
+//
+// If instead you configure the job as "Pipeline script from SCM" pointing at this repo,
+// use the plain `Jenkinsfile` (which relies on main.tf being checked out next to it).
+//
+// PREREQUISITES:
+//   - Jenkins agent has terraform, aws cli, jq, openssl (the demo Dockerfile installs them)
+//   - AWS creds reachable in the container (static keys via env — see docker-compose.yml)
+//   - Event trigger created on the custom agent, pointed at the webhook (for the review to run)
+//   - Jenkins credentials: webhook-url (WEBHOOK_URL), webhook-secret (WEBHOOK_SECRET)
+
+pipeline {
+  agent any
+
+  parameters {
+    string(name: 'AWS_REGION', defaultValue: 'us-east-1',      description: 'AWS region to deploy into')
+    string(name: 'STACK_NAME', defaultValue: 'obs-agent-demo', description: 'Label used in the agent payload')
+    booleanParam(name: 'DESTROY_AFTER', defaultValue: false,   description: 'Run terraform destroy at the end')
+  }
+
+  environment {
+    WEBHOOK_URL    = credentials('webhook-url')
+    WEBHOOK_SECRET = credentials('webhook-secret')
+  }
+
+  stages {
+
+    stage('Write Terraform') {
+      steps {
+        // No SCM checkout in an inline pipeline, so materialize main.tf here.
+        writeFile file: 'main.tf', text: '''
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = var.region
+}
+
+variable "region" {
+  type    = string
+  default = "us-east-1"
+}
+
+variable "name_prefix" {
+  type    = string
+  default = "obs-agent-demo"
+}
+
+data "aws_ami" "al2023" {
+  most_recent = true
+  owners      = ["amazon"]
+  filter {
+    name   = "name"
+    values = ["al2023-ami-*-x86_64"]
+  }
+}
+
+resource "aws_instance" "web" {
+  ami           = data.aws_ami.al2023.id
+  instance_type = "t3.micro"
+  tags = {
+    Name = "${var.name_prefix}-web"
+    env  = "dev"
+  }
+}
+
+resource "aws_s3_bucket" "assets" {
+  bucket_prefix = "${var.name_prefix}-assets-"
+  force_destroy = true
+  tags = {
+    Name = "${var.name_prefix}-assets"
+    env  = "dev"
+  }
+}
+
+output "instance_id" {
+  value = aws_instance.web.id
+}
+
+output "bucket_name" {
+  value = aws_s3_bucket.assets.bucket
+}
+'''
+        sh 'ls -la main.tf'
+      }
+    }
+
+    stage('Terraform Init') {
+      steps {
+        sh 'terraform init -input=false -no-color'
+      }
+    }
+
+    stage('Terraform Apply (real resources)') {
+      steps {
+        sh '''
+          terraform apply -auto-approve -input=false -no-color -var "region=${AWS_REGION}"
+          terraform plan -input=false -no-color -var "region=${AWS_REGION}" -out=tfplan.bin
+          terraform show -json tfplan.bin > plan.json
+        '''
+      }
+    }
+
+    stage('Notify Observability Agent') {
+      steps {
+        sh '''
+          jq '{
+              eventType: "deployment",
+              action: "create",
+              source: "terraform",
+              stack: "'"${STACK_NAME}"'",
+              region: "'"${AWS_REGION}"'",
+              resources: [
+                  .resource_changes[]
+                  | select(.change.actions[0] == "create")
+                  | {
+                      address: .address,
+                      type: .type,
+                      action: .change.actions[0],
+                      config: (
+                          .change.after
+                          | {instance_class, allocated_storage, engine, engine_version,
+                             identifier, memory_size, timeout, runtime, function_name,
+                             load_balancer_type, name, node_type, num_cache_nodes, tags}
+                          | with_entries(select(.value != null))
+                      )
+                  }
+              ]
+          }' plan.json > slim_payload.json
+
+          echo "Slim payload size: $(wc -c < slim_payload.json) chars (limit 10000)"
+
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          SIGNATURE=$(printf "%s:%s" "$TIMESTAMP" "$(cat slim_payload.json)" | \
+              openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary | base64)
+
+          HTTP_CODE=$(curl -sS -o agent_resp.txt -w "%{http_code}" \
+              -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -H "x-amzn-event-timestamp: $TIMESTAMP" \
+              -H "x-amzn-event-signature: $SIGNATURE" \
+              --data-binary @slim_payload.json)
+
+          echo "Webhook responded HTTP $HTTP_CODE"
+          cat agent_resp.txt || true
+          echo
+          case "$HTTP_CODE" in
+            2*) echo "Review triggered. Open the custom agent's run history to see the recommendations." ;;
+            *)  echo "Webhook rejected (HTTP $HTTP_CODE). Check: trigger exists, secret matches, payload <10K, signature bytes match." ; exit 1 ;;
+          esac
+        '''
+      }
+    }
+
+    stage('Archive payloads') {
+      steps {
+        archiveArtifacts artifacts: 'slim_payload.json,plan.json', allowEmptyArchive: true
+      }
+    }
+
+    stage('Teardown (optional)') {
+      when { expression { return params.DESTROY_AFTER } }
+      steps {
+        sh 'terraform destroy -auto-approve -input=false -no-color -var "region=${AWS_REGION}"'
+      }
+    }
+  }
+
+  post {
+    always {
+      echo 'Done. If DESTROY_AFTER was false, remember to run terraform destroy to avoid charges.'
+    }
+  }
+}
