@@ -1,0 +1,121 @@
+// Jenkins + Terraform demo: deploy REAL resources, then notify the Observability Agent
+// (custom DevOps Agent) which reviews CloudWatch alarm coverage and returns recommendations.
+//
+// Flow: terraform init -> apply (real t3.micro + S3) -> show -json -> slim payload ->
+//       HMAC-signed POST to the Agent Space webhook -> event trigger fires the custom agent.
+//
+// This is tool-agnostic by design: the only Jenkins-specific part is how the two secrets
+// are injected. The same shell runs in GitHub Actions / GitLab / CodeBuild unchanged.
+//
+// PREREQUISITES (see README.md):
+//   - Jenkins agent has: terraform, aws cli, jq, openssl  (the demo Dockerfile installs them)
+//   - AWS credentials available to terraform (env vars or mounted ~/.aws)
+//   - An EVENT TRIGGER exists on the custom agent, pointed at the webhook, filter
+//     resources[?action=='create']  (you create this once in the DevOps Agent console)
+//   - Jenkins credentials: webhook-url (WEBHOOK_URL), webhook-secret (WEBHOOK_SECRET)
+
+pipeline {
+  agent any
+
+  parameters {
+    string(name: 'AWS_REGION',  defaultValue: 'us-east-1',        description: 'AWS region to deploy into')
+    string(name: 'STACK_NAME',  defaultValue: 'obs-agent-demo',   description: 'Label used in the agent payload')
+    booleanParam(name: 'DESTROY_AFTER', defaultValue: false,      description: 'Run terraform destroy at the end (clean up the demo resources)')
+  }
+
+  environment {
+    WEBHOOK_URL    = credentials('webhook-url')      // Jenkins "Secret text" credential ID
+    WEBHOOK_SECRET = credentials('webhook-secret')   // Jenkins "Secret text" credential ID
+    // AWS creds: provide via Jenkins AWS credentials binding or mounted ~/.aws (see README).
+  }
+
+  stages {
+
+    stage('Terraform Init') {
+      steps {
+        dir('.') {
+          sh 'terraform init -input=false -no-color'
+        }
+      }
+    }
+
+    stage('Terraform Apply (real resources)') {
+      steps {
+        sh '''
+          terraform apply -auto-approve -input=false -no-color \
+            -var "region=${AWS_REGION}"
+          # capture the plan JSON of what now exists, for the agent payload
+          terraform plan -input=false -no-color -var "region=${AWS_REGION}" -out=tfplan.bin
+          terraform show -json tfplan.bin > plan.json
+        '''
+      }
+    }
+
+    stage('Notify Observability Agent') {
+      steps {
+        sh '''
+          # Extract only the fields the agent needs — keeps payload well under the 10K char limit
+          jq '{
+              eventType: "deployment",
+              action: "create",
+              source: "terraform",
+              stack: "'"${STACK_NAME}"'",
+              region: "'"${AWS_REGION}"'",
+              resources: [
+                  .resource_changes[]
+                  | select(.change.actions[0] == "create")
+                  | {
+                      address: .address,
+                      type: .type,
+                      action: .change.actions[0],
+                      config: (
+                          .change.after
+                          | {instance_class, allocated_storage, engine, engine_version,
+                             identifier, memory_size, timeout, runtime, function_name,
+                             load_balancer_type, name, node_type, num_cache_nodes, tags}
+                          | with_entries(select(.value != null))
+                      )
+                  }
+              ]
+          }' plan.json > slim_payload.json
+
+          echo "Slim payload size: $(wc -c < slim_payload.json) chars (limit 10000)"
+
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          # Sign the EXACT bytes we will send (read from the file), so signed==sent.
+          SIGNATURE=$(printf "%s:%s" "$TIMESTAMP" "$(cat slim_payload.json)" | \
+              openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary | base64)
+
+          HTTP_CODE=$(curl -sS -o agent_resp.txt -w "%{http_code}" \
+              -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              -H "x-amzn-event-timestamp: $TIMESTAMP" \
+              -H "x-amzn-event-signature: $SIGNATURE" \
+              --data-binary @slim_payload.json)
+
+          echo "Webhook responded HTTP $HTTP_CODE"
+          cat agent_resp.txt || true
+          echo
+          case "$HTTP_CODE" in
+            2*) echo "Review triggered. Open the custom agent's run history to see the recommendations." ;;
+            *)  echo "Webhook rejected (HTTP $HTTP_CODE). Check: trigger exists, secret matches, payload <10K, signature bytes match." ; exit 1 ;;
+          esac
+        '''
+      }
+    }
+
+    stage('Teardown (optional)') {
+      when { expression { return params.DESTROY_AFTER } }
+      steps {
+        sh 'terraform destroy -auto-approve -input=false -no-color -var "region=${AWS_REGION}"'
+      }
+    }
+  }
+
+  post {
+    always {
+      echo 'Done. If DESTROY_AFTER was false, remember to run terraform destroy to avoid charges.'
+      archiveArtifacts artifacts: 'slim_payload.json,plan.json', allowEmptyArchive: true
+    }
+  }
+}

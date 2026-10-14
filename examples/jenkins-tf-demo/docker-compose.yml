@@ -1,0 +1,22 @@
+services:
+  jenkins:
+    build: .
+    container_name: obs-agent-jenkins-demo
+    ports:
+      - "8080:8080"     # Jenkins UI
+      - "50000:50000"   # agent port
+    volumes:
+      - jenkins_home:/var/jenkins_home
+      # Mount your AWS credentials read-only so terraform can deploy.
+      # Alternative: inject AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY as env below.
+      - ${HOME}/.aws:/var/jenkins_home/.aws:ro
+    environment:
+      - AWS_PROFILE=${AWS_PROFILE:-default}
+      - AWS_REGION=${AWS_REGION:-us-east-1}
+      # If you prefer static keys instead of a mounted profile, uncomment and set:
+      # - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      # - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      # - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
+
+volumes:
+  jenkins_home:
