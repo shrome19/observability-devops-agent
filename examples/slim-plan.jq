@@ -34,7 +34,7 @@
           name, load_balancer_type,
           node_type, num_cache_nodes,
           instance_type,
-          volume_size,
+          volume_size, ebs_volume_size, instance_count,
           tags
         } | with_entries(select(.value != null)))
       }

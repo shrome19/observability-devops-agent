@@ -79,9 +79,11 @@ pipeline {
                        type: .type,
                        action: .change.actions[0],
                        config: (.change.after
-                         | {instance_class, allocated_storage, engine, engine_version,
-                            identifier, memory_size, timeout, runtime, function_name,
-                            load_balancer_type, name, node_type, num_cache_nodes, tags}
+                         | {instance_type, instance_class, allocated_storage,
+                            engine, engine_version, identifier, memory_size, timeout,
+                            runtime, function_name, load_balancer_type, name,
+                            node_type, num_cache_nodes, volume_size, ebs_volume_size,
+                            instance_count, tags}
                          | with_entries(select(.value != null)))
                      })) as $resources
              | {

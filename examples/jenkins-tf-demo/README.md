@@ -1,134 +1,244 @@
 # Jenkins + Terraform demo — deploy real resources, auto-review alarm coverage
 
-End-to-end demo: a Jenkins pipeline deploys **real** AWS resources with Terraform, then
-notifies the Observability Agent (custom DevOps Agent), which reviews CloudWatch alarm
-coverage and returns recommendations in its run history.
+End-to-end demo (validated working): a Jenkins pipeline deploys **real** AWS resources
+with Terraform, then notifies the Observability Agent (custom DevOps Agent), which
+reviews CloudWatch alarm coverage and returns recommendations in its run history.
 
 ```
 Jenkins job
   ├─ terraform init
-  ├─ terraform apply   → real t3.micro EC2 + S3 bucket (NO alarms)
-  ├─ terraform show -json → plan.json
-  └─ Notify stage: slim payload → HMAC-signed POST → Agent Space webhook
+  ├─ terraform plan -out  → terraform show -json → plan.json   (captures CREATE actions)
+  ├─ terraform apply (the saved plan)             → real t3.micro EC2 + S3 (NO alarms)
+  └─ Notify stage: slim INCIDENT payload → HMAC-signed POST → Agent Space webhook (200)
                                                         │
-                                                        ▼  event trigger fires
-                                        pre-deploy-observability-reviewer
+                                   (two independent consumers of the webhook event:)
+                                   ├─ always: a generic Investigation (incident default)
+                                   └─ event trigger matches data.resources[?action=='create']
+                                                        ▼
+                                        pre-deploy-observability-reviewer custom agent
                                           → CloudWatch coverage recommendations
 ```
 
-This shows the tool-agnostic story: Jenkins only POSTs a signed event; the review logic
-lives in the agent + skill. The same POST step runs unchanged in any CI.
+Tool-agnostic by design: Jenkins only POSTs a signed event; the review logic lives in
+the agent + skill. The same POST step runs unchanged in any CI (GitHub Actions, GitLab,
+CodeBuild).
 
 ---
 
-## ⚠️ One-time prerequisite you MUST do first: the event trigger
+## ⚠️ Prerequisites you MUST get right (these are the things that bite)
 
-The pipeline POSTs to your Agent Space webhook. For that POST to actually run **your**
-custom agent, an **event trigger** must connect the webhook to the agent. You have the
-webhook integration already; create the trigger:
+### 1. The event trigger (and its filter path)
 
-1. DevOps Agent web app → **Agents** → open `pre-deploy-observability-reviewer`.
-2. **Triggers** tab → **Create trigger** → **Event**.
-3. **Event source:** your connected webhook integration.
-4. **Filter expression:** `resources[?action=='create']`
-   (fires only when something is being created; passes just those resources as context).
-5. Save.
+The pipeline POSTs to your Agent Space webhook. The webhook does TWO things with an
+`eventType: "incident"` event, independently:
 
-Without this trigger, the webhook accepts the POST (HTTP 2xx) but nothing runs. If you
-cannot create it yet, you can still prove the agent works via direct invocation (see
-"Testing without the trigger" below).
+- It **always** spins up a generic **Investigation** (that's the default for incident
+  events — expected background noise, ignore it).
+- **Separately**, your custom agent's **event trigger** evaluates its filter against the
+  same payload and runs the custom agent only if the filter matches.
+
+Create the trigger: DevOps Agent web app → **Agents** → `pre-deploy-observability-reviewer`
+→ **Triggers** → **Create trigger** → **Event** → **Event source:** your webhook
+integration → **Filter expression:**
+
+```
+data.resources[?action=='create']
+```
+
+> **Critical:** the filter path is `data.resources`, NOT `resources`. The payload nests
+> the resource list under `data` (incident schema — see below). A top-level
+> `resources[?action=='create']` evaluates against the root, finds nothing, and the
+> trigger never fires even on a perfect payload. This cost us a full debugging cycle.
+
+### 2. The payload is the fixed INCIDENT schema (not a custom shape)
+
+The generic webhook rejects a custom top-level shape (e.g. `eventType: "deployment"`).
+It requires the incident schema, with your resource detail nested in the free-form
+`data` object:
+
+```json
+{
+  "eventType": "incident",
+  "incidentId": "tf-<stack>-<ts>",
+  "action": "created",
+  "priority": "MEDIUM",
+  "title": "...",
+  "description": "... review_type=predeploy_observability ...",
+  "timestamp": "2026-10-14T22:06:19.000Z",
+  "service": "Terraform",
+  "data": { "review_type": "predeploy_observability", "resources": [ ... ] }
+}
+```
+
+### 3. HMAC signing must be byte-exact
+
+Signature = `base64( HMAC-SHA256( secret, "<timestamp>:<body>" ) )`, sent as headers
+`x-amzn-event-timestamp` and `x-amzn-event-signature`. Two gotchas we hit, both now
+handled in the Jenkinsfile:
+
+- **Timestamp needs milliseconds** — `...T22:06:19.000Z`, matching JavaScript
+  `toISOString()`. A second-precision timestamp signs a different string than the server
+  reconstructs → 403.
+- **Signed bytes must equal sent bytes** — `jq` writes the payload file with a trailing
+  newline. `$(cat file)` in a shell substitution strips it, but `--data-binary @file`
+  sends it. The Jenkinsfile builds the exact signing input in a file so signed == sent.
+
+A mismatch on any of these surfaces as a generic **403 "Invalid request"**.
+
+### 4. The whitelisted config fields must include the resource's size field
+
+The slim filter keeps only specific `config` keys to stay under the 10K limit. It MUST
+include the field that carries each resource's size/capacity, or the agent only sees
+tags and falls back to baseline-default thresholds. The filter includes
+`instance_type` (EC2), `instance_class`/`allocated_storage` (RDS), `memory_size`/`timeout`
+(Lambda), `node_type` (ElastiCache), `volume_size`/`ebs_volume_size`/`instance_count`
+(OpenSearch). If you add a resource type, add its size field here too.
 
 ---
 
-## Prerequisites
+## Prerequisites (environment)
 
-- Docker (to run Jenkins locally).
-- AWS credentials with permission to create EC2 + S3 (and to destroy them after).
-  - **Heads-up:** `terraform apply` here creates REAL, billable resources. They are
-    tiny (t3.micro + empty S3 bucket) but you MUST tear them down (see Teardown).
-- The webhook URL and shared secret from your Agent Space webhook integration.
+- Docker (runs Jenkins locally).
+- AWS credentials that can create EC2 + S3 (and destroy them after). **`terraform apply`
+  creates REAL, billable resources** — tiny (t3.micro + empty S3), but tear them down.
+- Your Agent Space webhook URL and shared secret.
 
 ---
 
-## 1. Build and start Jenkins
+## 1. Build and start Jenkins (with AWS creds as static env keys)
+
+The base `jenkins/jenkins` image has none of terraform/aws/jq/openssl — the demo
+`Dockerfile` installs them. For credentials, this demo passes **static temporary keys
+as env vars**, NOT a mounted `~/.aws` profile.
+
+> **Why not mount `~/.aws`?** Isengard/SSO profiles use
+> `credential_process = isengardcli`, which does not exist inside the container, so a
+> mounted profile fails with "No such file: isengardcli". Static keys sidestep that.
+
+On your host, export fresh creds, then build/start:
 
 ```bash
+# get temp creds for the account (e.g. isengardcli credentials <profile> --format env)
+export AWS_ACCESS_KEY_ID=ASIA...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_SESSION_TOKEN=...          # required for temporary creds
+export AWS_REGION=us-east-1
+
 cd devops-auto/custom-agent/examples/jenkins-tf-demo
-# make your AWS creds available to the container (mounts ~/.aws read-only by default)
-export AWS_PROFILE=your-profile          # or set static keys in docker-compose.yml
 docker compose up -d --build
 ```
 
-Jenkins comes up at http://localhost:8080 (admin / admin). The image includes
-terraform, aws cli, jq, and openssl.
+Jenkins: http://localhost:8080 (admin / admin).
 
-> If your AWS access is via short-lived creds (e.g. Isengard/Midway), the mounted
-> `~/.aws` must contain currently-valid credentials when the job runs. Refresh them if
-> the apply fails with an auth error.
+> **Creds expire.** Containers capture env at creation time. When the temp keys expire,
+> re-export them on the host and recreate the container so it picks up the new values:
+> `docker compose up -d --force-recreate`. (The `jenkins_home` volume persists, so your
+> job config and credentials survive.) Verify with:
+> `docker exec obs-agent-jenkins-demo aws sts get-caller-identity`.
 
 ## 2. Add Jenkins credentials
 
-**Manage Jenkins → Credentials → (global) → Add Credentials**, two "Secret text" entries:
+**Manage Jenkins → Credentials → (global) → Add Credentials** — two "Secret text" entries:
 
 | ID | Secret |
 |----|--------|
-| `webhook-url` | your Agent Space webhook URL |
+| `webhook-url` | your Agent Space webhook URL (`https://event-ai.<region>.api.aws/webhook/generic/<id>`) |
 | `webhook-secret` | the webhook shared secret |
 
-(The Jenkinsfile references these IDs via `credentials('webhook-url')` / `('webhook-secret')`.)
+Paste values with no quotes and no trailing newline. If you rotate the webhook secret in
+the console, update `webhook-secret` here — Jenkins reads it fresh each build, **no
+container recreate needed** (unlike AWS creds, which are container env).
 
-## 3. Create the pipeline job
+## 3. Create the pipeline job (Pipeline from SCM)
 
-- **New Item → Pipeline**, name it `tf-alarm-review-demo`.
-- **Pipeline → Definition: Pipeline script from SCM** (point at this repo), or paste the
-  `Jenkinsfile` contents into an inline **Pipeline script**.
-- Save.
+- **New Item → Pipeline**, name it e.g. `tf-alarm-review-demo`.
+- **Pipeline → Definition: Pipeline script from SCM** → Git.
+  - **Repository URL:** your repo (e.g. `https://github.com/<you>/observability-devops-agent`)
+  - **Credentials:** none if the repo is public; otherwise a GitHub PAT credential.
+  - **Branches to build:** `*/main`
+  - **Script Path:** `examples/jenkins-tf-demo/Jenkinsfile`
+    (repo-relative — this repo IS the custom-agent folder, so there is no
+    `devops-auto/custom-agent/` prefix.)
+
+> SCM checkout lands the whole repo in the workspace, so `main.tf` is at
+> `examples/jenkins-tf-demo/main.tf`. The Jenkinsfile runs all terraform/jq steps inside
+> that subdir via `dir("${TF_DIR}")`. (If you instead paste the pipeline inline with no
+> SCM checkout, use `Jenkinsfile.inline`, which `writeFile`s main.tf into the workspace.)
 
 ## 4. Run it
 
 **Build with Parameters:**
 - `AWS_REGION` — e.g. `us-east-1`
-- `STACK_NAME` — label for the payload, e.g. `obs-agent-demo`
-- `DESTROY_AFTER` — check this to auto-`terraform destroy` at the end (recommended for a
-  one-shot demo), or leave unchecked and destroy manually.
+- `STACK_NAME` — payload label, e.g. `obs-agent-demo`
+- `DESTROY_AFTER` — **leave unchecked** so you can verify the review before teardown.
 
-Watch the console: you'll see the apply create the EC2 + S3, the slim payload size
-(well under 10K), and `Webhook responded HTTP 2xx`. Then open the custom agent's **run
-history** — a new coverage review for `obs-agent-demo` appears within a minute.
+Console check:
+- `Slim payload size: <~1KB> chars` with a **non-empty** `data.resources`
+- `Webhook responded HTTP 200`
+
+Then confirm the custom agent ran (see next section).
+
+---
+
+## ⚠️ Re-running requires a destroy first (Terraform is idempotent)
+
+The filter matches `action == "create"`. Terraform only reports `create` for resources
+that **don't exist yet**. After a successful apply, the resources exist, so the next
+run's plan is a **no-op** → `data.resources: []` → the trigger's filter doesn't match →
+the custom agent doesn't fire (and the webhook even rejects an empty event).
+
+So for each demo run: **destroy first, then run.** From your host:
+
+```bash
+docker exec -e AWS_REGION=us-east-1 obs-agent-jenkins-demo \
+  sh -c 'cd /var/jenkins_home/workspace/<JOB_NAME>/examples/jenkins-tf-demo \
+         && terraform destroy -auto-approve -no-color -var region=us-east-1'
+```
+
+(Replace `<JOB_NAME>` with your pipeline job's name. "0 destroyed" = already clean;
+"2 destroyed" = it removed the EC2 + S3.)
+
+> If you want frictionless repeat demos without destroying, change the trigger filter
+> and the Jenkinsfile to review ALL resources rather than only creates — but create-only
+> is the more honest "new resources trigger a review" story.
+
+---
+
+## Confirming the custom agent actually ran
+
+A webhook 200 means *accepted*, not *agent ran*. To verify the custom agent fired:
+
+- **Console:** open `pre-deploy-observability-reviewer` → its run history. A run titled
+  `Event trigger: eventChannel` with your resources in the payload = success. (A generic
+  Investigation also appears — that's the incident-webhook default, not the custom agent.)
+- **Programmatically:** list CUSTOM tasks for the agent space and look for a new task
+  with `assetId` = your agent's asset id and `trigger_id` = your event trigger's goal id.
 
 ---
 
 ## Teardown (do not skip)
 
-The resources are real and billable. Either:
-- Run the job with `DESTROY_AFTER=true`, **or**
-- From the Jenkins workspace (or locally): `terraform destroy -auto-approve -var "region=us-east-1"`
-
-To stop Jenkins: `docker compose down` (add `-v` to also delete the Jenkins home volume).
+Resources are real and billable. Destroy with the command above (or run the job with
+`DESTROY_AFTER=true` for a one-shot). Stop Jenkins with `docker compose down` (`-v` also
+deletes the Jenkins home volume).
 
 ---
 
-## Testing without the trigger (fallback)
+## Fallback: prove the agent without the webhook/trigger
 
-If you have not created the event trigger yet and want to prove the agent produces a
-review, invoke the custom agent directly instead of via the webhook — this is what the
-Kiro MCP `create_custom_agent_task` call does (asset `ki-46453028-8cdf-429c-aa4f-ffa572945cfc`).
-It bypasses the webhook/trigger entirely. The webhook path is the real automatic flow;
-direct invocation is just a connectivity/behavior check.
+To test the agent's behavior independent of the webhook routing, invoke it directly by
+asset id (`ki-46453028-8cdf-429c-aa4f-ffa572945cfc`) — e.g. the Kiro MCP
+`create_custom_agent_task`, or the DevOps Agent API. This bypasses the webhook and the
+event trigger entirely; useful to confirm the skill/behavior while debugging routing.
 
 ---
 
 ## Notes
 
-- **Signing:** HMAC-SHA256 over `<timestamp>:<body>`, base64, headers
-  `x-amzn-event-timestamp` / `x-amzn-event-signature` — the same scheme as this repo's
-  `alarm-ingestion` Lambda. The step signs and sends the exact same bytes (`--data-binary
-  @slim_payload.json`) so the signature matches.
-- **Timing:** this notifies the agent AFTER apply, so the resources exist — the agent can
-  even check their live alarm state. To review BEFORE apply instead, move the Notify
-  stage ahead of apply and build the payload from a `terraform plan` (not apply) output.
-- **Advisory, not a gate:** a 2xx means the agent was notified; the pipeline does not
-  block on the review. Make it blocking only with a deliberate follow-up poll step.
-- **Verify in your account:** that the webhook accepts the signature, that the event
-  trigger routes to this agent, and that egress to the webhook is allowed by your
+- **Advisory, not a gate:** a 200 means the agent was notified; the pipeline does not
+  block on the review outcome. Make it blocking only with a deliberate follow-up poll.
+- **Timing:** the pipeline plans first (to capture creates), then applies that plan, so
+  the payload reflects what is being created. The review runs just after apply.
+- **Verify in your account:** webhook accepts the signature, the trigger filter matches
+  your payload shape (`data.resources[...]`), and egress to the webhook is allowed by
   account guardrails.
