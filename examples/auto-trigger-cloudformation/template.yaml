@@ -1,0 +1,213 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Observability Agent — CloudFormation auto-trigger (reference, deploy with caution).
+  Fires the pre-deploy-observability-reviewer custom agent automatically when a
+  CloudFormation (or CDK) stack reaches CREATE_COMPLETE / UPDATE_COMPLETE. No CI tool
+  is involved — CloudFormation emits the stack event to EventBridge natively, a Lambda
+  slims the resource list and POSTs a signed payload to the Agent Space webhook.
+
+  This is the CI-FREE automatic path (contrast with the Terraform path, which needs a
+  pipeline step because Terraform emits no AWS-native deploy event).
+
+  SECURITY NOTE: this Lambda makes an OUTBOUND POST to the agent webhook. Confirm your
+  account's egress guardrails permit it before deploying. The webhook secret is read
+  from Secrets Manager, never hardcoded.
+
+Parameters:
+  WebhookUrl:
+    Type: String
+    Description: Agent Space webhook URL (event-trigger integration)
+  WebhookSecretArn:
+    Type: String
+    Description: >
+      Secrets Manager ARN of a secret containing the webhook shared secret.
+      The secret value is used as-is (plain string) for HMAC signing.
+  ExcludeStackName:
+    Type: String
+    Default: ''
+    Description: >
+      (Optional) A stack name to ignore — set this to THIS stack's own name so the
+      trigger does not react to its own deploy. Leave blank to react to all stacks.
+
+Resources:
+
+  ReviewTriggerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: observability-agent-cfn-trigger
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt ReviewTriggerRole.Arn
+      Environment:
+        Variables:
+          WEBHOOK_URL: !Ref WebhookUrl
+          WEBHOOK_SECRET_ARN: !Ref WebhookSecretArn
+          EXCLUDE_STACK_NAME: !Ref ExcludeStackName
+      # Inline code kept small and dependency-free (uses Node built-ins + AWS SDK v3
+      # which is present in the nodejs20 runtime). Replace with a bundled zip if you
+      # prefer to version the handler as a file.
+      Code:
+        ZipFile: |
+          const crypto = require("node:crypto");
+          const { CloudFormationClient, DescribeStackResourcesCommand } = require("@aws-sdk/client-cloudformation");
+          const { SecretsManagerClient, GetSecretValueCommand } = require("@aws-sdk/client-secrets-manager");
+
+          const cfn = new CloudFormationClient({});
+          const sm = new SecretsManagerClient({});
+
+          // CloudFormation resource type -> whether the skill has a baseline tier.
+          // Only these are worth sending; the agent handles the rest gracefully, but
+          // filtering keeps the payload tiny and under the 10,000-char cap.
+          const TIER_TYPES = new Set([
+            "AWS::EC2::Instance",
+            "AWS::Lambda::Function",
+            "AWS::RDS::DBInstance",
+            "AWS::ElasticLoadBalancingV2::LoadBalancer",
+            "AWS::ElastiCache::CacheCluster",
+            "AWS::ElastiCache::ReplicationGroup",
+            "AWS::OpenSearchService::Domain",
+            "AWS::Elasticsearch::Domain",
+            "AWS::S3::Bucket"
+          ]);
+
+          exports.handler = async (event) => {
+            const detail = event?.detail || {};
+            const status = detail["status-details"]?.status;
+            const stackId = detail["stack-id"];
+
+            // Only react to successful create/update completions.
+            if (status !== "CREATE_COMPLETE" && status !== "UPDATE_COMPLETE") {
+              console.log("Ignoring status:", status);
+              return { skipped: true, reason: "status_not_complete", status };
+            }
+            if (!stackId) {
+              console.log("No stack-id in event");
+              return { skipped: true, reason: "no_stack_id" };
+            }
+
+            const stackName = stackId.split("/")[1] || stackId;
+            if (process.env.EXCLUDE_STACK_NAME && stackName === process.env.EXCLUDE_STACK_NAME) {
+              console.log("Ignoring self/excluded stack:", stackName);
+              return { skipped: true, reason: "excluded_stack", stackName };
+            }
+
+            // List the stack's resources, keep only ones with a baseline tier.
+            const resp = await cfn.send(new DescribeStackResourcesCommand({ StackName: stackId }));
+            const resources = (resp.StackResources || [])
+              .filter(r => TIER_TYPES.has(r.ResourceType))
+              .map(r => ({
+                address: r.LogicalResourceId,
+                type: r.ResourceType,
+                action: "create",
+                config: { physical_id: r.PhysicalResourceId }
+              }));
+
+            if (resources.length === 0) {
+              console.log("No alarm-tier resources in stack; nothing to review.");
+              return { skipped: true, reason: "no_tier_resources", stackName };
+            }
+
+            const payload = {
+              eventType: "deployment",
+              action: "create",
+              source: "cloudformation",
+              stack: stackName,
+              region: event.region,
+              resources
+            };
+            const body = JSON.stringify(payload);
+            if (body.length >= 10000) {
+              // Should be rare post-filter; if a stack is huge, chunk it.
+              console.warn("Payload >=10000 chars; agent may reject. Size:", body.length);
+            }
+
+            // Load the webhook secret and sign exactly like alarm-ingestion does:
+            // HMAC-SHA256 over "<timestamp>:<body>", base64.
+            const sec = await sm.send(new GetSecretValueCommand({ SecretId: process.env.WEBHOOK_SECRET_ARN }));
+            const secret = (sec.SecretString || "").trim();
+            const ts = new Date().toISOString();
+            const sig = crypto.createHmac("sha256", secret).update(`${ts}:${body}`, "utf8").digest("base64");
+
+            const r = await fetch(process.env.WEBHOOK_URL, {
+              method: "POST",
+              headers: {
+                "Content-Type": "application/json",
+                "x-amzn-event-timestamp": ts,
+                "x-amzn-event-signature": sig
+              },
+              body
+            });
+            const text = await r.text();
+            console.log("Webhook response:", r.status, text);
+            return { ok: r.ok, status: r.status, stack: stackName, resourceCount: resources.length };
+          };
+
+  ReviewTriggerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: observability-agent-cfn-trigger-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CfnTriggerLeastPrivilege
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Read the stack's resource list (read-only).
+              - Effect: Allow
+                Action:
+                  - cloudformation:DescribeStackResources
+                Resource: '*'
+              # Read ONLY the specific webhook secret.
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref WebhookSecretArn
+
+  # EventBridge rule — the native, CI-free trigger.
+  StackCompleteRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: observability-agent-cfn-stack-complete
+      Description: Fire the observability agent when a CFN/CDK stack create/update completes
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.cloudformation
+        detail-type:
+          - "CloudFormation Stack Status Change"
+        detail:
+          status-details:
+            status:
+              - CREATE_COMPLETE
+              - UPDATE_COMPLETE
+      Targets:
+        - Id: ReviewTriggerLambda
+          Arn: !GetAtt ReviewTriggerFunction.Arn
+
+  EventBridgeInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ReviewTriggerFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt StackCompleteRule.Arn
+
+Outputs:
+  TriggerFunctionName:
+    Value: !Ref ReviewTriggerFunction
+  EventRuleArn:
+    Value: !GetAtt StackCompleteRule.Arn
+  Note:
+    Value: >
+      Set ExcludeStackName to this stack's own name on deploy so it does not trigger on
+      itself. CDK stacks are CloudFormation stacks, so this rule covers CDK too.

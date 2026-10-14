@@ -1,0 +1,56 @@
+// Example Jenkins pipeline stage — pre-deploy observability review after terraform apply.
+//
+// This mimics a customer's Jenkins flow, but note what it is NOT: it does NOT reuse the
+// old `devops-auto/jenkins-predeploy-alarms/` integration (API Gateway + SigV4 Jenkinsfile
+// + poll stage). That version was coupled to Jenkins. THIS version just calls the portable
+// `review-alarms.sh` — the identical script that also runs in GitHub Actions, GitLab, or
+// CodeBuild. Jenkins is only the caller; the review logic lives in the agent + skill.
+//
+// The agent (terraform/jq/openssl must be on the agent's PATH) runs the hook with two
+// Jenkins credentials. Nothing Jenkins-specific exists except how the env vars are injected.
+
+pipeline {
+  agent any
+
+  environment {
+    // Store these as Jenkins "Secret text" credentials, then reference by ID.
+    AGENT_WEBHOOK_URL    = credentials('agent-webhook-url')
+    AGENT_WEBHOOK_SECRET = credentials('agent-webhook-secret')
+    // Where the portable hook + jq filter live in the checkout:
+    SLIM_JQ = "${WORKSPACE}/devops-auto/custom-agent/examples/slim-plan.jq"
+  }
+
+  stages {
+
+    stage('Terraform Apply') {
+      steps {
+        dir('infra') {              // <-- customer's Terraform working dir
+          sh 'terraform init -input=false'
+          sh 'terraform apply -auto-approve -input=false'
+        }
+      }
+    }
+
+    // This is the whole integration: one stage that calls the portable hook.
+    stage('Pre-Deploy Alarm Review') {
+      steps {
+        dir('infra') {
+          sh '''
+            bash "${WORKSPACE}/devops-auto/custom-agent/examples/pipeline/review-alarms.sh"
+          '''
+        }
+      }
+    }
+  }
+
+  post {
+    always {
+      // The review is ADVISORY — the webhook POST returning 2xx means the agent
+      // accepted the payload and will review asynchronously (results land in the
+      // agent's run history). This stage does not gate the pipeline on the review
+      // outcome. To make it blocking, add a follow-up stage that polls the agent's
+      // run history and fails on must-have gaps — a deliberate choice, not default.
+      echo 'Alarm coverage review triggered (advisory). See the agent run history.'
+    }
+  }
+}
