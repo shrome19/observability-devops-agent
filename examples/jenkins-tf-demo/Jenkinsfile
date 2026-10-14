@@ -71,10 +71,10 @@ pipeline {
           # description, timestamp, service, and a free-form `data` object). Our custom
           # deployment/resource details go INSIDE `data` — a top-level custom shape like
           # eventType:"deployment" is rejected. The slim resource list keeps us under 10K.
-          # Build the payload: slim the plan's CREATE resources, then MERGE each
-          # resource's real ARN (from post-apply state) onto its own config, keyed by
-          # Terraform address. ARNs are computed-after-apply, so they only exist in
-          # state.json, not plan.json. Attaching per-resource (not a flat outputs blob)
+          # Build the payload: slim the CREATE resources from the plan, then MERGE each
+          # real ARN (from post-apply state) onto its own config, keyed by Terraform
+          # address. ARNs are computed-after-apply, so they only exist in state.json,
+          # not plan.json. Attaching per-resource (not a flat outputs blob)
           # means the agent never has to guess which ARN belongs to which resource.
           jq -n \
             --slurpfile plan plan.json \
@@ -93,8 +93,8 @@ pipeline {
                        address: $addr,
                        type: .type,
                        action: .change.actions[0],
-                       # slim the plan config, then attach THIS resource's real ARN
-                       # (looked up by address via $addr), then drop any null fields.
+                       # slim the plan config, then attach the real ARN for this
+                       # resource (looked up by address via $addr), then drop nulls.
                        config: ((.change.after
                            | {instance_type, instance_class, allocated_storage,
                               engine, engine_version, identifier, memory_size, timeout,
