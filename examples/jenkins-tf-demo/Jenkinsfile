@@ -106,12 +106,20 @@ pipeline {
 
           # Must match the server's expected ISO-8601 WITH milliseconds (e.g.
           # 2026-10-14T21:37:34.000Z). JavaScript's toISOString() — used by the
-          # reference alarm-ingestion signer — always includes .000; a timestamp
-          # without it signs a different string than the server reconstructs → 403.
+          # reference alarm-ingestion signer — always includes .000.
           TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
-          # Sign the EXACT bytes we will send (read from the file), so signed==sent.
-          SIGNATURE=$(printf "%s:%s" "$TIMESTAMP" "$(cat slim_payload.json)" | \
-              openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary | base64)
+
+          # CRITICAL: the bytes we SIGN must equal the bytes we SEND. jq writes the
+          # file with a trailing newline. "$(cat file)" in a command substitution
+          # STRIPS that trailing newline, but --data-binary @file KEEPS it — so
+          # signing $(cat ...) while sending the file signs 1 fewer byte than it
+          # sends → signature mismatch → 403. Fix: build the exact signing input
+          # (timestamp + ":" + raw file bytes) in a file with no added/removed
+          # bytes, sign THAT file, and send the same payload file unchanged.
+          : > sign_input.bin
+          printf "%s:" "$TIMESTAMP" >> sign_input.bin
+          cat slim_payload.json      >> sign_input.bin
+          SIGNATURE=$(openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary sign_input.bin | base64)
 
           HTTP_CODE=$(curl -sS -o agent_resp.txt -w "%{http_code}" \
               -X POST "$WEBHOOK_URL" \
