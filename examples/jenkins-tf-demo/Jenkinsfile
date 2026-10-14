@@ -62,34 +62,53 @@ pipeline {
       steps {
         dir("${TF_DIR}") {
         sh '''
-          # Extract only the fields the agent needs — keeps payload well under the 10K char limit
-          jq '{
-              eventType: "deployment",
-              action: "create",
-              source: "terraform",
-              stack: "'"${STACK_NAME}"'",
-              region: "'"${AWS_REGION}"'",
-              resources: [
-                  .resource_changes[]
-                  | select(.change.actions[0] == "create")
-                  | {
-                      address: .address,
-                      type: .type,
-                      action: .change.actions[0],
-                      config: (
-                          .change.after
-                          | {instance_class, allocated_storage, engine, engine_version,
-                             identifier, memory_size, timeout, runtime, function_name,
-                             load_balancer_type, name, node_type, num_cache_nodes, tags}
-                          | with_entries(select(.value != null))
-                      )
-                  }
-              ]
-          }' plan.json > slim_payload.json
+          # The webhook expects the fixed INCIDENT event schema (eventType "incident",
+          # incidentId, action created|updated|closed|resolved, priority, title,
+          # description, timestamp, service, and a free-form `data` object). Our custom
+          # deployment/resource details go INSIDE `data` — a top-level custom shape like
+          # eventType:"deployment" is rejected. The slim resource list keeps us under 10K.
+          jq -n \
+            --slurpfile plan plan.json \
+            --arg stack "${STACK_NAME}" \
+            --arg region "${AWS_REGION}" \
+            --arg ts "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \
+            '($plan[0].resource_changes
+               | map(select(.change.actions[0] == "create")
+                   | {
+                       address: .address,
+                       type: .type,
+                       action: .change.actions[0],
+                       config: (.change.after
+                         | {instance_class, allocated_storage, engine, engine_version,
+                            identifier, memory_size, timeout, runtime, function_name,
+                            load_balancer_type, name, node_type, num_cache_nodes, tags}
+                         | with_entries(select(.value != null)))
+                     })) as $resources
+             | {
+                 eventType: "incident",
+                 incidentId: ("tf-" + $stack + "-" + ($ts | gsub("[^0-9]";""))),
+                 action: "created",
+                 priority: "MEDIUM",
+                 title: ("Pre-deploy alarm coverage review: " + $stack),
+                 description: ("Terraform deployment of " + ($resources | length | tostring) + " resource(s) in " + $region + ". review_type=predeploy_observability. Review CloudWatch alarm coverage for the created resources and return recommendations."),
+                 timestamp: $ts,
+                 service: "Terraform",
+                 data: {
+                   review_type: "predeploy_observability",
+                   source: "terraform",
+                   stack: $stack,
+                   region: $region,
+                   resources: $resources
+                 }
+               }' > slim_payload.json
 
           echo "Slim payload size: $(wc -c < slim_payload.json) chars (limit 10000)"
 
-          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          # Must match the server's expected ISO-8601 WITH milliseconds (e.g.
+          # 2026-10-14T21:37:34.000Z). JavaScript's toISOString() — used by the
+          # reference alarm-ingestion signer — always includes .000; a timestamp
+          # without it signs a different string than the server reconstructs → 403.
+          TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%S.000Z")
           # Sign the EXACT bytes we will send (read from the file), so signed==sent.
           SIGNATURE=$(printf "%s:%s" "$TIMESTAMP" "$(cat slim_payload.json)" | \
               openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -binary | base64)
