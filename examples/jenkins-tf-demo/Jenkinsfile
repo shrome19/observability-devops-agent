@@ -104,6 +104,14 @@ pipeline {
       }
     }
 
+    stage('Archive payloads') {
+      steps {
+        // archiveArtifacts needs a workspace/node context, so it lives in a stage
+        // (not in the pipeline-level post block, which has no node → FilePath error).
+        archiveArtifacts artifacts: 'slim_payload.json,plan.json', allowEmptyArchive: true
+      }
+    }
+
     stage('Teardown (optional)') {
       when { expression { return params.DESTROY_AFTER } }
       steps {
@@ -115,7 +123,6 @@ pipeline {
   post {
     always {
       echo 'Done. If DESTROY_AFTER was false, remember to run terraform destroy to avoid charges.'
-      archiveArtifacts artifacts: 'slim_payload.json,plan.json', allowEmptyArchive: true
     }
   }
 }
