@@ -46,11 +46,13 @@ pipeline {
       steps {
         dir("${TF_DIR}") {
           sh '''
-            terraform apply -auto-approve -input=false -no-color \
-              -var "region=${AWS_REGION}"
-            # capture the plan JSON of what now exists, for the agent payload
+            # Plan FIRST so the plan JSON captures the "create" actions. If we applied
+            # first, the subsequent plan would be a no-op (resources already exist) and
+            # the agent payload would be empty. Order matters here.
             terraform plan -input=false -no-color -var "region=${AWS_REGION}" -out=tfplan.bin
             terraform show -json tfplan.bin > plan.json
+            # Now apply the exact plan we just captured.
+            terraform apply -input=false -no-color -auto-approve tfplan.bin
           '''
         }
       }
