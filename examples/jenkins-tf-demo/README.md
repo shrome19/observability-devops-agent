@@ -96,6 +96,54 @@ tags and falls back to baseline-default thresholds. The filter includes
 
 ---
 
+## Customizing what the agent considers
+
+The agent can only reason about what the payload contains. What reaches it is governed
+by **two knobs**, plus a free-form escape hatch:
+
+### Knob 1 — the slim-filter whitelist (which plan fields reach the agent)
+
+The jq step in the Notify stage keeps only an allow-list of `config` keys (to stay under
+the 10K limit). A field in the Terraform plan that is NOT on the list is dropped before
+the agent sees it — which is exactly why EC2 recommendations once fell back to defaults:
+`instance_type` was missing from the list. To have the agent factor in another field
+(e.g. RDS `storage_type`, `multi_az`, or EBS `iops`), add that field name to the jq
+whitelist in the Notify stage (and in `../slim-plan.jq` if you use the portable hook).
+
+Rule of thumb: if it is size/capacity-related and the skill's runbook already uses it,
+whitelisting it is all you need. Keep the list lean — the whitelist exists because a
+full plan exceeds the 10K input cap.
+
+### Knob 2 — the skill runbooks (how a field maps to an alarm)
+
+A field only changes a recommendation if the skill knows what to do with it. The RDS
+runbook (C1) uses `allocated_storage` to derive the FreeStorageSpace threshold; the EC2
+runbook (A1) treats a burstable `instance_type` as a reason to add CPUCreditBalance. If
+you pass a field the runbooks do not reference (say, a company-specific tag), the agent
+sees it but has no rule tying it to an alarm. For such fields, extend the relevant
+runbook under `../../skills/predeploy-alarm-recommendations/references/`.
+
+### Escape hatch — free-form `data`
+
+The payload's `data` object is free-form. To pass a one-off instruction without editing
+jq (e.g. "prod databases must alarm on ReplicaLag"), add it as text under `data`. The
+agent reads it as context. Good for ad-hoc policy; use the runbooks for anything you
+want applied consistently.
+
+### Resource ARNs (merged from post-apply state)
+
+The pipeline attaches each resource's **real ARN** to its own `config.arn`, so the agent
+can emit concrete alarm dimensions (exact InstanceId / LoadBalancer suffix / etc.) rather
+than post-deploy placeholders. ARNs are **computed-after-apply** — they do not exist in
+the plan — so the Apply stage captures post-apply state (`terraform show -json >
+state.json`) and the Notify stage merges `address -> arn` onto each resource by Terraform
+address. This per-resource attachment (not a flat outputs blob) means the agent never has
+to guess which ARN belongs to which resource, which stays correct even with several
+resources of the same type. Note this makes the flow inherently **post-apply** (resources
+exist when the agent reviews them), which is already how this pipeline runs.
+
+---
+
 ## Prerequisites (environment)
 
 - Docker (runs Jenkins locally).
