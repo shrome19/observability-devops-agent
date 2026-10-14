@@ -53,6 +53,10 @@ pipeline {
             terraform show -json tfplan.bin > plan.json
             # Now apply the exact plan we just captured.
             terraform apply -input=false -no-color -auto-approve tfplan.bin
+            # Capture post-apply STATE as JSON — this is where real ARNs live (ARNs are
+            # computed, so they are unknown at plan time; only state has them). The Notify
+            # stage merges these ARNs onto each resource by its Terraform address.
+            terraform show -json > state.json
           '''
         }
       }
@@ -67,23 +71,37 @@ pipeline {
           # description, timestamp, service, and a free-form `data` object). Our custom
           # deployment/resource details go INSIDE `data` — a top-level custom shape like
           # eventType:"deployment" is rejected. The slim resource list keeps us under 10K.
+          # Build the payload: slim the plan's CREATE resources, then MERGE each
+          # resource's real ARN (from post-apply state) onto its own config, keyed by
+          # Terraform address. ARNs are computed-after-apply, so they only exist in
+          # state.json, not plan.json. Attaching per-resource (not a flat outputs blob)
+          # means the agent never has to guess which ARN belongs to which resource.
           jq -n \
             --slurpfile plan plan.json \
+            --slurpfile state state.json \
             --arg stack "${STACK_NAME}" \
             --arg region "${AWS_REGION}" \
             --arg ts "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \
-            '($plan[0].resource_changes
+            '# address -> arn lookup from post-apply state
+             (($state[0].values.root_module.resources // [])
+               | map(select(.mode == "managed") | {key: .address, value: .values.arn})
+               | from_entries) as $arns
+             | ($plan[0].resource_changes
                | map(select(.change.actions[0] == "create")
+                   | .address as $addr
                    | {
-                       address: .address,
+                       address: $addr,
                        type: .type,
                        action: .change.actions[0],
-                       config: (.change.after
-                         | {instance_type, instance_class, allocated_storage,
-                            engine, engine_version, identifier, memory_size, timeout,
-                            runtime, function_name, load_balancer_type, name,
-                            node_type, num_cache_nodes, volume_size, ebs_volume_size,
-                            instance_count, tags}
+                       # slim the plan config, then attach THIS resource's real ARN
+                       # (looked up by address via $addr), then drop any null fields.
+                       config: ((.change.after
+                           | {instance_type, instance_class, allocated_storage,
+                              engine, engine_version, identifier, memory_size, timeout,
+                              runtime, function_name, load_balancer_type, name,
+                              node_type, num_cache_nodes, volume_size, ebs_volume_size,
+                              instance_count, tags})
+                         + {arn: $arns[$addr]}
                          | with_entries(select(.value != null)))
                      })) as $resources
              | {
