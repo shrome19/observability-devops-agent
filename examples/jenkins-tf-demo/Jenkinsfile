@@ -27,13 +27,16 @@ pipeline {
     WEBHOOK_URL    = credentials('webhook-url')      // Jenkins "Secret text" credential ID
     WEBHOOK_SECRET = credentials('webhook-secret')   // Jenkins "Secret text" credential ID
     // AWS creds: provide via Jenkins AWS credentials binding or mounted ~/.aws (see README).
+    // When checked out via SCM, main.tf lives in this subfolder of the repo, not the
+    // workspace root — all terraform/jq steps run inside it.
+    TF_DIR = 'examples/jenkins-tf-demo'
   }
 
   stages {
 
     stage('Terraform Init') {
       steps {
-        dir('.') {
+        dir("${TF_DIR}") {
           sh 'terraform init -input=false -no-color'
         }
       }
@@ -41,18 +44,21 @@ pipeline {
 
     stage('Terraform Apply (real resources)') {
       steps {
-        sh '''
-          terraform apply -auto-approve -input=false -no-color \
-            -var "region=${AWS_REGION}"
-          # capture the plan JSON of what now exists, for the agent payload
-          terraform plan -input=false -no-color -var "region=${AWS_REGION}" -out=tfplan.bin
-          terraform show -json tfplan.bin > plan.json
-        '''
+        dir("${TF_DIR}") {
+          sh '''
+            terraform apply -auto-approve -input=false -no-color \
+              -var "region=${AWS_REGION}"
+            # capture the plan JSON of what now exists, for the agent payload
+            terraform plan -input=false -no-color -var "region=${AWS_REGION}" -out=tfplan.bin
+            terraform show -json tfplan.bin > plan.json
+          '''
+        }
       }
     }
 
     stage('Notify Observability Agent') {
       steps {
+        dir("${TF_DIR}") {
         sh '''
           # Extract only the fields the agent needs — keeps payload well under the 10K char limit
           jq '{
@@ -101,6 +107,7 @@ pipeline {
             *)  echo "Webhook rejected (HTTP $HTTP_CODE). Check: trigger exists, secret matches, payload <10K, signature bytes match." ; exit 1 ;;
           esac
         '''
+        }
       }
     }
 
@@ -108,14 +115,17 @@ pipeline {
       steps {
         // archiveArtifacts needs a workspace/node context, so it lives in a stage
         // (not in the pipeline-level post block, which has no node → FilePath error).
-        archiveArtifacts artifacts: 'slim_payload.json,plan.json', allowEmptyArchive: true
+        // The payload files are written inside TF_DIR, so reference them there.
+        archiveArtifacts artifacts: "${TF_DIR}/slim_payload.json, ${TF_DIR}/plan.json", allowEmptyArchive: true
       }
     }
 
     stage('Teardown (optional)') {
       when { expression { return params.DESTROY_AFTER } }
       steps {
-        sh 'terraform destroy -auto-approve -input=false -no-color -var "region=${AWS_REGION}"'
+        dir("${TF_DIR}") {
+          sh 'terraform destroy -auto-approve -input=false -no-color -var "region=${AWS_REGION}"'
+        }
       }
     }
   }
