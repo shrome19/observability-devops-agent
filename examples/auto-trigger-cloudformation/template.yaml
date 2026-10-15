@@ -94,6 +94,9 @@ Resources:
             }
 
             // List the stack's resources, keep only ones with a baseline tier.
+            // PhysicalResourceId is the dimension-ready identifier for most types
+            // (InstanceId for EC2, bucket name for S3, DBInstanceIdentifier for RDS,
+            // etc.), so it plays the same role the ARN does in the Terraform path.
             const resp = await cfn.send(new DescribeStackResourcesCommand({ StackName: stackId }));
             const resources = (resp.StackResources || [])
               .filter(r => TIER_TYPES.has(r.ResourceType))
@@ -109,13 +112,27 @@ Resources:
               return { skipped: true, reason: "no_tier_resources", stackName };
             }
 
+            // IMPORTANT: the webhook requires the fixed INCIDENT schema, and the custom
+            // agent's event trigger filters on data.resources[?action=='create'] — so
+            // the resource list MUST live under `data.resources`, not at the top level.
+            // (A flat eventType:"deployment" shape is rejected / never matches the filter.)
+            const ts = new Date().toISOString();
             const payload = {
-              eventType: "deployment",
-              action: "create",
-              source: "cloudformation",
-              stack: stackName,
-              region: event.region,
-              resources
+              eventType: "incident",
+              incidentId: `cfn-${stackName}-${ts.replace(/[^0-9]/g, "")}`,
+              action: "created",
+              priority: "MEDIUM",
+              title: `Pre-deploy alarm coverage review: ${stackName}`,
+              description: `CloudFormation stack ${stackName} reached ${status} with ${resources.length} alarm-tier resource(s) in ${event.region}. review_type=predeploy_observability. Review CloudWatch alarm coverage for the created resources and return recommendations.`,
+              timestamp: ts,
+              service: "CloudFormation",
+              data: {
+                review_type: "predeploy_observability",
+                source: "cloudformation",
+                stack: stackName,
+                region: event.region,
+                resources
+              }
             };
             const body = JSON.stringify(payload);
             if (body.length >= 10000) {
@@ -124,10 +141,10 @@ Resources:
             }
 
             // Load the webhook secret and sign exactly like alarm-ingestion does:
-            // HMAC-SHA256 over "<timestamp>:<body>", base64.
+            // HMAC-SHA256 over "<timestamp>:<body>", base64. (No trailing-newline hazard
+            // here as there was in the shell path — body is exactly what we sign AND send.)
             const sec = await sm.send(new GetSecretValueCommand({ SecretId: process.env.WEBHOOK_SECRET_ARN }));
             const secret = (sec.SecretString || "").trim();
-            const ts = new Date().toISOString();
             const sig = crypto.createHmac("sha256", secret).update(`${ts}:${body}`, "utf8").digest("base64");
 
             const r = await fetch(process.env.WEBHOOK_URL, {
