@@ -16,6 +16,13 @@ cover both deployment paths the demo needs:
 Both POST the **same slim payload shape** to the **same agent webhook** and sign it the
 **same way** (HMAC-SHA256 over `<timestamp>:<body>`), so the agent side is identical.
 
+> **Status: validated working.** Deployed end to end — a sample CFN stack
+> (`../sample-cloudformation/sample-stack.yaml`) reaching `CREATE_COMPLETE` fired the
+> EventBridge rule → trigger Lambda → webhook → custom agent, which produced a coverage
+> review (Lambda→B1, OpenSearch→E2, S3→F1) citing the stack's real resource identifiers.
+> The Lambda sends the **incident schema** with resources under `data.resources`, matching
+> the custom agent's event-trigger filter `data.resources[?action=='create']`.
+
 ## Flow
 
 ```
@@ -60,10 +67,21 @@ Deploy any small CFN stack (e.g. the `../sample-cloudformation/sample-stack.yaml
 it reach `CREATE_COMPLETE`, then check the agent's run history for a coverage review of
 that stack's resources.
 
+> **Do NOT hardcode globally-unique resource names in the test stack.** An explicit
+> `BucketName` (S3 names are global), `DomainName`, or `FunctionName` that already exists
+> fails the account's `AWS::EarlyValidation::ResourceExistenceCheck` with "resource ...
+> already exists" — before the stack even creates. Let CloudFormation generate names
+> (omit `BucketName`/`DomainName`/`FunctionName`). The sample stack does this. OpenSearch
+> also takes ~15-20 min to create, which dominates the deploy time.
+
 ## Caveats (verify before relying on this)
 
-- **This is reference code, not deployed by this repo.** Review the IAM and the
-  outbound POST against your account's policies first.
+- **Validated in one account; still review before reusing.** This path was deployed and
+  fired the agent end to end. Review the IAM and the outbound POST against your own
+  account's policies before relying on it.
+- **Name collisions fail Early Validation.** Do not hardcode globally-unique names
+  (S3 `BucketName`, OpenSearch `DomainName`, Lambda `FunctionName`) in stacks you deploy
+  through this — let CloudFormation generate them. See "Test end-to-end" above.
 - **Egress guardrails.** The Lambda makes an outbound HTTPS POST to the agent webhook.
   The same account guardrails that blocked Lambda Function URLs earlier in this project
   could affect outbound calls — confirm egress is allowed.

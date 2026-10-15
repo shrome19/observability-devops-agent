@@ -18,7 +18,8 @@ Resources:
   ApiHandler:
     Type: AWS::Lambda::Function
     Properties:
-      FunctionName: checkout-api-handler
+      # No explicit FunctionName — CloudFormation generates a unique one, avoiding
+      # the AWS::EarlyValidation::ResourceExistenceCheck collision on reused names.
       Runtime: nodejs20.x
       Handler: index.handler
       Timeout: 30
@@ -66,7 +67,7 @@ Resources:
   SearchDomain:
     Type: AWS::OpenSearchService::Domain
     Properties:
-      DomainName: catalog-search-prod
+      # No explicit DomainName — CloudFormation generates a unique one.
       EngineVersion: OpenSearch_2.11
       ClusterConfig:
         InstanceType: m6g.large.search
@@ -83,7 +84,9 @@ Resources:
   AssetsBucket:
     Type: AWS::S3::Bucket
     Properties:
-      BucketName: checkout-assets-prod
+      # No explicit BucketName — S3 names are GLOBALLY unique, so a hardcoded name
+      # (checkout-assets-prod) collides with any existing bucket and fails the
+      # AWS::EarlyValidation::ResourceExistenceCheck. Let CloudFormation generate one.
       Tags:
         - Key: env
           Value: !Ref Env

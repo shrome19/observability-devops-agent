@@ -33,6 +33,47 @@ The agent is two parts, attached separately in the DevOps Agent console:
 
 ---
 
+## What the skill knows (runbook codes)
+
+The skill is organized as per-service runbooks under
+`skills/predeploy-alarm-recommendations/references/`. Each code is one reference file
+defining the baseline CloudWatch alarms for a service (you will see these codes in the
+agent's output, e.g. "Lambda → B1"):
+
+| Code | Service | Baseline alarms |
+|------|---------|-----------------|
+| **A1** | EC2 | CPUUtilization, StatusCheckFailed (+ CPUCreditBalance for burstable) |
+| **B1** | Lambda | Errors, Throttles, Duration-near-timeout |
+| **C1** | RDS | CPUUtilization, FreeStorageSpace, DatabaseConnections |
+| **D1** | ALB | HTTPCode_ELB_5XX, TargetResponseTime p95, UnHealthyHostCount |
+| **E1** | ElastiCache | EngineCPUUtilization, DatabaseMemoryUsagePercentage, Evictions |
+| **E2** | OpenSearch | ClusterStatus.red/yellow, JVMMemoryPressure, FreeStorageSpace |
+| **F1** | S3 | 5xxErrors (request-path buckets only; often "no alarm needed") |
+| **G1** | CloudHSM | *(deliberately none — monitor via logs/state, not threshold alarms)* |
+| **T1** | Terraform parsing | how to read a `terraform show -json` plan |
+| **T2** | CloudFormation/CDK parsing | how to read a CFN template / deployed stack |
+| **Z1** | Cross-cutting | severity-by-environment, tagging, notifications, gap synthesis |
+
+The skill is **advisory** — it recommends alarms and maps them to a deployable
+`recommended-alarms.yaml`; it never creates resources, and it is not an IaC linter
+(that is `cfn-lint`/`checkov`/`terraform validate`).
+
+## Three ways to trigger it (all validated end to end)
+
+| Path | How the agent is triggered | CI tool? | Where |
+|------|----------------------------|----------|-------|
+| **Manual** | Paste IaC / ask in the IDE or console | None | — |
+| **Terraform** | CI pipeline step signs + POSTs the plan to the webhook | Any CI (demoed on Jenkins) | `examples/jenkins-tf-demo/`, `examples/pipeline/` |
+| **CloudFormation / CDK** | EventBridge `Stack Status Change` → Lambda → webhook | None (event-native) | `examples/auto-trigger-cloudformation/` |
+
+All three POST the same **incident-schema** payload (resources under `data.resources`),
+HMAC-signed, to the Agent Space webhook; a single **event trigger** on the agent
+(filter `data.resources[?action=='create']`) runs the custom agent. The webhook also
+spins up a generic Investigation for incident events — that is expected and separate
+from the custom-agent run.
+
+---
+
 ## How this fits with other DevOps Agent capabilities
 
 | Capability | Timing | Question it answers | Setup needed |
