@@ -171,12 +171,16 @@ export AWS_ACCESS_KEY_ID=ASIA...
 export AWS_SECRET_ACCESS_KEY=...
 export AWS_SESSION_TOKEN=...          # required for temporary creds
 export AWS_REGION=us-east-1
+# Jenkins admin password (12+ chars). There's no default; compose won't start without it.
+read -rs -p "Jenkins admin password: " JENKINS_ADMIN_PASSWORD; echo; export JENKINS_ADMIN_PASSWORD
 
 cd devops-auto/custom-agent/examples/jenkins-tf-demo
 docker compose up -d --build
 ```
 
-Jenkins: http://localhost:8080 (admin / admin).
+Jenkins: http://localhost:8080 (user `admin`, the password you set). The UI is bound
+to `127.0.0.1` only, because the container holds AWS credentials and shouldn't be
+reachable from your network.
 
 > **Creds expire.** Containers capture env at creation time. When the temp keys expire,
 > re-export them on the host and recreate the container so it picks up the new values:

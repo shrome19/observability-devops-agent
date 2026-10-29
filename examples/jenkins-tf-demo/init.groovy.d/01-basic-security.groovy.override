@@ -1,0 +1,38 @@
+// Creates (or updates) the local admin user and enables login on every boot,
+// so you don't have to fish the initial admin password out of the logs.
+// The password comes from JENKINS_ADMIN_PASSWORD; there is no default. If it's
+// missing or too short, Jenkins refuses to start rather than run with a guessable login.
+import jenkins.model.*
+import hudson.security.*
+
+def instance = Jenkins.getInstance()
+def adminId = System.getenv("JENKINS_ADMIN_ID") ?: "admin"
+def adminPw = System.getenv("JENKINS_ADMIN_PASSWORD")
+
+if (!adminPw || adminPw.length() < 12 || adminPw == "admin") {
+    throw new IllegalStateException(
+        "JENKINS_ADMIN_PASSWORD must be set (12+ characters) before starting this container")
+}
+
+def realm = instance.getSecurityRealm()
+if (!(realm instanceof HudsonPrivateSecurityRealm)) {
+    realm = new HudsonPrivateSecurityRealm(false)
+    instance.setSecurityRealm(realm)
+}
+
+def existing = realm.getUser(adminId)
+if (existing == null) {
+    realm.createAccount(adminId, adminPw)
+    println "--> Created Jenkins admin user '${adminId}'"
+} else {
+    // Keeps an existing jenkins_home volume in sync with the password you set
+    // (older volumes from this demo were created with admin/admin).
+    existing.addProperty(HudsonPrivateSecurityRealm.Details.fromPlainPassword(adminPw))
+    existing.save()
+    println "--> Updated password for Jenkins admin user '${adminId}'"
+}
+
+def strategy = new FullControlOnceLoggedInAuthorizationStrategy()
+strategy.setAllowAnonymousRead(false)
+instance.setAuthorizationStrategy(strategy)
+instance.save()
