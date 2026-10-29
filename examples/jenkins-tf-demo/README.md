@@ -172,7 +172,7 @@ export AWS_SECRET_ACCESS_KEY=...
 export AWS_SESSION_TOKEN=...          # required for temporary creds
 export AWS_REGION=us-east-1
 # Jenkins admin password (12+ chars). There's no default; compose won't start without it.
-read -rs -p "Jenkins admin password: " JENKINS_ADMIN_PASSWORD; echo; export JENKINS_ADMIN_PASSWORD
+printf 'Jenkins admin password: '; read -rs JENKINS_ADMIN_PASSWORD; echo; export JENKINS_ADMIN_PASSWORD
 
 cd devops-auto/custom-agent/examples/jenkins-tf-demo
 docker compose up -d --build
