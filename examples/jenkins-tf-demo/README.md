@@ -166,7 +166,10 @@ as env vars**, NOT a mounted `~/.aws` profile.
 On your host, export fresh creds, then build/start:
 
 ```bash
-# get temp creds for the account (e.g. isengardcli credentials <profile> --format env)
+# Easiest: export temp creds from the profile you already use (Isengard/SSO work too).
+# Compose refuses to start if these are empty.
+eval "$(aws configure export-credentials --format env)"
+# ...or set them by hand:
 export AWS_ACCESS_KEY_ID=ASIA...
 export AWS_SECRET_ACCESS_KEY=...
 export AWS_SESSION_TOKEN=...          # required for temporary creds

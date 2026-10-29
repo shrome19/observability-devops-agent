@@ -22,9 +22,13 @@ services:
       #   export AWS_ACCESS_KEY_ID=ASIA...
       #   export AWS_SECRET_ACCESS_KEY=...
       #   export AWS_SESSION_TOKEN=...      # required for temporary/Isengard creds
-      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
-      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
-      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN}
+      # Required: compose refuses to start with empty credentials, instead of
+      # starting a container that can't call AWS. Quickest way to set them from
+      # an existing profile (Isengard/SSO included):
+      #   eval "$(aws configure export-credentials --format env)"
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:?export AWS credentials before docker compose up}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:?export AWS credentials before docker compose up}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
       - AWS_REGION=${AWS_REGION:-us-east-1}
       # Jenkins admin login. No default: compose refuses to start until you set it.
       #   printf 'Jenkins admin password: '; read -rs JENKINS_ADMIN_PASSWORD; echo; export JENKINS_ADMIN_PASSWORD
